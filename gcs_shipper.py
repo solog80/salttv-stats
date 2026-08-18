@@ -26,7 +26,8 @@ from google.auth.transport.requests import Request
 from google.cloud import storage
 
 LOG = os.environ.get("LOG", "/data/logs/proxy-host-4_viewers.log")
-BUCKET = os.environ.get("BUCKET", "salt-media-app1-viewer-logs")
+BUCKET = os.environ.get("BUCKET", "<bucket>")
+GCP_PROJECT = os.environ.get("GCP_PROJECT", "<gcp-project-id>")
 STATE = os.environ.get("STATE", "/state/offset")
 GEO_FILE = os.environ.get("GEO_FILE", "/state/geo.tsv")
 SEED_GEO = os.environ.get("SEED_GEO", "/cache/geo.tsv")
@@ -223,7 +224,7 @@ class Shipper:
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],
                 request=Request(),
             )
-            self._client = storage.Client(project="salt-media-app1", credentials=creds)
+            self._client = storage.Client(project=GCP_PROJECT, credentials=creds)
         return self._client
 
     def _load_state(self):

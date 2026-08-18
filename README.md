@@ -113,9 +113,9 @@ BigQuery for long-term storage and SQL analytics — no Firebase involved.
 
 ```
 Edge NPM viewer log ──► log-shipper container (parse + geo/ASN enrich, gzip)
-   ──► gs://salt-media-app1-viewer-logs/viewer-logs/date=YYYYMMDD/hour=HH/*.jsonl.gz
-   ──► BigQuery external table viewer_logs.viewer_requests (live, free ingestion)
-   ──► scheduled MERGE ──► viewer_logs.viewer_requests_native (DAY-partitioned on ts)
+   ──► gs://<bucket-name>/viewer-logs/date=YYYYMMDD/hour=HH/*.jsonl.gz
+   ──► BigQuery external table <dataset>.viewer_requests (live, free ingestion)
+   ──► scheduled MERGE ──► <dataset>.viewer_requests_native (DAY-partitioned on ts)
 ```
 
 - **Shipper**: `gcs_shipper.py` runs as the `log-shipper` container on the
@@ -124,18 +124,18 @@ Edge NPM viewer log ──► log-shipper container (parse + geo/ASN enrich, gzi
   is_datacenter`, and uploads gzipped NDJSON every 30 s. IPv4 geo via
   ip-api.com, IPv6 via ipwho.is, cached to `/state/geo.tsv` (seeded from the
   stats API cache).
-- **External table** (`viewer_logs.viewer_requests`): reads GCS live via
+- **External table** (`<dataset>.viewer_requests`): reads GCS live via
   hive partitioning on `date`/`hour`. Schema: `ts, status, uri, stream,
   file_type, session, client_ip, user_agent, referer, country_code, country,
   isp, asn, is_datacenter`.
-- **Filtered view** (`viewer_logs.viewer_requests_real`): `WHERE NOT
+- **Filtered view** (`<dataset>.viewer_requests_real`): `WHERE NOT
   is_datacenter` — the BigQuery equivalent of `filter_dc=1`.
-- **Native table** (`viewer_logs.viewer_requests_native`): a scheduled query
+- **Native table** (`<dataset>.viewer_requests_native`): a scheduled query
   runs every 10 min and `MERGE`s new rows (deduped on `ts+client_ip+uri`)
   into a DAY-partitioned table for faster queries.
 
-GCP setup: bucket `salt-media-app1-viewer-logs` (EU nearline); the
-`firebase-adminsdk-ruyjd` service account holds `bigquery.dataEditor`,
+GCP setup: bucket `<bucket-name>` (EU nearline); the
+`<sa-name>` service account holds `bigquery.dataEditor`,
 `bigquery.jobUser`, and `storage.objectAdmin`. Credentials are mounted into
 the container at `/creds/creds.json`.
 
@@ -145,13 +145,13 @@ Example SQL:
 -- Real (non-datacenter) viewers per stream, per minute
 SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, stream,
        COUNT(DISTINCT client_ip) AS viewers
-FROM `viewer_logs.viewer_requests_real`
+FROM `<dataset>.viewer_requests_real`
 WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
 GROUP BY minute, stream ORDER BY minute DESC;
 
 -- Countries of real viewers, last 30 min
 SELECT country, COUNT(DISTINCT client_ip) AS viewers
-FROM `viewer_logs.viewer_requests_real`
+FROM `<dataset>.viewer_requests_real`
 WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
 GROUP BY country ORDER BY viewers DESC;
 ```
@@ -162,9 +162,21 @@ Never query BigQuery directly from the browser — the service account key would
 be exposed. Instead, add a small **Firebase Function** that runs the SQL
 server-side and returns JSON, then call it from React.
 
+### Which source to use?
+
+Both come from the same NPM log; pick by what you're showing:
+
+| Use case | Source | Endpoint | Latency | Retention |
+|----------|--------|----------|---------|-----------|
+| Live "watching now" badge | Edge API | `stats.salttelevision.com/api/viewers?minutes=5` | seconds | minutes |
+| Historical/analytics (trends, peaks, per-stream over time) | Firebase Function + BigQuery | callable `getViewerStats` | 30s–10min | unlimited |
+
+Use both: the edge API for the live badge, the Firebase Function for charts
+and history.
+
 ### 1. Firebase Function
 
-In your Firebase project (`salt-media-app1`), add a callable function:
+In your Firebase project (`<project-id>`), add a callable function:
 
 ```js
 // functions/index.js (or getViewerStats.js)
@@ -173,12 +185,12 @@ const admin = require("firebase-admin");
 const { BigQuery } = require("@google-cloud/bigquery");
 
 admin.initializeApp();
-const bq = new BigQuery({ projectId: "salt-media-app1" });
+const bq = new BigQuery({ projectId: "<project-id>" });
 
 const REAL_VIEWERS_SQL = `
   SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, stream,
          COUNT(DISTINCT client_ip) AS viewers
-  FROM \`viewer_logs.viewer_requests_real\`
+  FROM \`<dataset>.viewer_requests_real\`
   WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @minutes MINUTE)
   GROUP BY minute, stream
   ORDER BY minute DESC`;
@@ -193,7 +205,7 @@ exports.getViewerCountries = functions.https.onCall(async () => {
   const [rows] = await bq.query({
     query: `
       SELECT country, COUNT(DISTINCT client_ip) AS viewers
-      FROM \`viewer_logs.viewer_requests_real\`
+      FROM \`<dataset>.viewer_requests_real\`
       WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
       GROUP BY country ORDER BY viewers DESC`,
   });
@@ -210,16 +222,16 @@ firebase deploy --only functions
 The function's runtime service account needs BigQuery read access (run once):
 
 ```bash
-gcloud projects add-iam-policy-binding salt-media-app1 \
-  --member="serviceAccount:salt-media-app1@appspot.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding <project-id> \
+  --member="serviceAccount:<project-id>@appspot.gserviceaccount.com" \
   --role="roles/bigquery.dataViewer"
-gcloud projects add-iam-policy-binding salt-media-app1 \
-  --member="serviceAccount:salt-media-app1@appspot.gserviceaccount.com" \
+gcloud projects add-iam-policy-binding <project-id> \
+  --member="serviceAccount:<project-id>@appspot.gserviceaccount.com" \
   --role="roles/bigquery.jobUser"
 ```
 
-> Use `viewer_logs.viewer_requests_real` (the filtered view) for real
-> viewer counts, or `viewer_logs.viewer_requests_native` (faster) with
+> Use `<dataset>.viewer_requests_real` (the filtered view) for real
+> viewer counts, or `<dataset>.viewer_requests_native` (faster) with
 > `WHERE NOT is_datacenter`.
 
 ### 2. React hook
@@ -281,7 +293,7 @@ fetch("https://stats.salttelevision.com/api/viewers?minutes=5&countries=1")
 
 ## Deployment
 
-On the edge server (`198.204.224.170`):
+On the edge server (`<EDGE_PUBLIC_IP>`):
 
 ```bash
 # NPM custom config (host-side at /data/compose/21/data/nginx/custom/)
