@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Ship NPM real-viewer log lines to GCS as gzipped NDJSON for BigQuery.
 
-Parses each line into fields, batches, gzips, and uploads to
+Parses each line into fields, enriches with geo/ASN (IPv4: ip-api.com,
+IPv6: ipwho.is), batches, gzips, and uploads to
 gs://<bucket>/viewer-logs/date=YYYYMMDD/hour=HH/part-<ts>-<n>.jsonl.gz
 
 Idempotent across restarts: tracks byte offset (inode+offset) in a state file.
+Geo results are cached to /state/geo.tsv and seeded from /cache/geo.tsv (the
+stats API cache, mounted read-only) when present.
 """
 import gzip
 import io
@@ -13,8 +16,10 @@ import os
 import re
 import time
 import threading
-import calendar
 import datetime
+import calendar
+import urllib.request
+import urllib.parse
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -23,6 +28,8 @@ from google.cloud import storage
 LOG = os.environ.get("LOG", "/data/logs/proxy-host-4_viewers.log")
 BUCKET = os.environ.get("BUCKET", "salt-media-app1-viewer-logs")
 STATE = os.environ.get("STATE", "/state/offset")
+GEO_FILE = os.environ.get("GEO_FILE", "/state/geo.tsv")
+SEED_GEO = os.environ.get("SEED_GEO", "/cache/geo.tsv")
 FLUSH_SECONDS = float(os.environ.get("FLUSH_SECONDS", "60"))
 FLUSH_BYTES = int(os.environ.get("FLUSH_BYTES", "1048576"))
 MAX_OLD_LINES = int(os.environ.get("MAX_OLD_LINES", "200000"))
@@ -35,6 +42,33 @@ _CLIENT = re.compile(r"client=(\S+)")
 _UA = re.compile(r'ua="([^"]*)"')
 _REF = re.compile(r'ref="([^"]*)"')
 _SESSION = re.compile(r"[?&]session=([^&\s]+)")
+
+DC_ASNS = {
+    24940, 213239, 212238, 60068, 15169, 16509, 14618, 8075,
+    14061, 16276, 20473, 63949, 51167, 13335, 31898, 45102,
+    54113, 20940,
+}
+DC_KEYWORDS = (
+    "hetzner", "datacamp", "digitalocean", "vultr", "linode", "contabo",
+    "ovh", "scaleway", "upcloud", "choopa", "amazon", "amazonaws",
+    "microsoft azure", "google cloud", "oracle cloud", "alibaba",
+    "cloudflare", "fastly", "akamai", "incapsula", "imperva",
+    "datacenter", "data center", "hosting", "dedicated server", "vps",
+)
+
+
+def is_datacenter(asn, org):
+    if asn:
+        try:
+            if int(asn) in DC_ASNS:
+                return True
+        except (TypeError, ValueError):
+            pass
+    if org:
+        o = org.lower()
+        if any(k in o for k in DC_KEYWORDS):
+            return True
+    return False
 
 
 def parse_ts(s):
@@ -64,7 +98,6 @@ def parse_line(line):
     uri = mu.group(1) if mu else ""
     mc = _CLIENT.search(line)
     client = mc.group(1) if mc else ""
-    # client may be a comma-separated XFF list; take the first (real viewer).
     client = client.split(",")[0].strip()
     ma = _UA.search(line)
     ua = ma.group(1) if ma else ""
@@ -72,7 +105,6 @@ def parse_line(line):
     ref = mr.group(1) if mr else ""
     ms = _SESSION.search(uri)
     session = ms.group(1) if ms else ""
-    # stream name from /app/<stream>/...
     sm = re.search(r"/app/([^/]+)/", uri)
     stream = sm.group(1) if sm else ""
     path = uri.split("?", 1)[0]
@@ -101,6 +133,74 @@ def parse_line(line):
     }
 
 
+class GeoResolver:
+    def __init__(self):
+        self.cache = {}
+        self.lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        for path in (SEED_GEO, GEO_FILE):
+            try:
+                with open(path) as f:
+                    for ln in f:
+                        parts = ln.rstrip("\n").split("\t")
+                        if len(parts) < 6:
+                            continue
+                        ip, cc, cn, isp, asn, org = parts[:6]
+                        if ip not in self.cache:
+                            self.cache[ip] = (cc, cn, isp, asn, org)
+            except FileNotFoundError:
+                pass
+
+    def _persist(self, ip, val):
+        try:
+            os.makedirs(os.path.dirname(GEO_FILE), exist_ok=True)
+            with open(GEO_FILE, "a") as f:
+                f.write("\t".join([ip, val[0], val[1], val[2], str(val[3]), val[4]]) + "\n")
+        except Exception:
+            pass
+
+    def _lookup(self, ip):
+        try:
+            if ":" in ip:
+                url = "https://ipwho.is/" + urllib.parse.quote(ip)
+                with urllib.request.urlopen(url, timeout=4) as r:
+                    d = json.loads(r.read().decode())
+                return (
+                    d.get("country_code", ""),
+                    d.get("country", ""),
+                    d.get("connection", {}).get("isp", ""),
+                    d.get("connection", {}).get("asn", ""),
+                    d.get("connection", {}).get("org", "") or d.get("connection", {}).get("isp", ""),
+                )
+            url = "http://ip-api.com/json/" + urllib.parse.quote(ip) + "?fields=query,countryCode,country,isp,org,as"
+            with urllib.request.urlopen(url, timeout=4) as r:
+                d = json.loads(r.read().decode())
+            asn = ""
+            m = re.match(r"AS(\d+)", str(d.get("as", "")))
+            if m:
+                asn = m.group(1)
+            return (
+                d.get("countryCode", ""),
+                d.get("country", ""),
+                d.get("isp", ""),
+                asn,
+                d.get("org", "") or d.get("isp", ""),
+            )
+        except Exception:
+            return "", "", "", "", ""
+
+    def get(self, ip):
+        with self.lock:
+            if ip in self.cache:
+                return self.cache[ip]
+            val = self._lookup(ip)
+            self.cache[ip] = val
+            self._persist(ip, val)
+            return val
+
+
 def _hive(ts):
     return ts.strftime("%Y%m%d"), ts.strftime("%H")
 
@@ -110,8 +210,8 @@ class Shipper:
         self.offset = 0
         self.inode = None
         self._client = None
-        self.buf = io.StringIO()
-        self.count = 0
+        self.geo = GeoResolver()
+        self.records = []
         self.part = 0
         self.lock = threading.Lock()
         self._load_state()
@@ -119,13 +219,10 @@ class Shipper:
     @property
     def gcs(self):
         if self._client is None:
-            if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
-                creds, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                    request=Request(),
-                )
-            else:
-                creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            creds, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                request=Request(),
+            )
             self._client = storage.Client(project="salt-media-app1", credentials=creds)
         return self._client
 
@@ -149,12 +246,10 @@ class Shipper:
             pass
 
     def _read_new(self):
-        """Return new lines since last offset. Resets if file rotated."""
         st = os.stat(LOG)
         cur_inode = st.st_ino
         cur_size = st.st_size
         if cur_inode != self.inode or self.inode is None:
-            # New file (rotation). Start from the end to avoid re-shipping.
             self.inode = cur_inode
             self.offset = 0 if cur_size < 10_000_000 else max(0, cur_size - 1_000_000)
         if self.offset > cur_size:
@@ -175,17 +270,16 @@ class Shipper:
 
     def _flush(self):
         with self.lock:
-            payload = self.buf.getvalue()
-            count = self.count
-            self.buf = io.StringIO()
-            self.count = 0
+            records = self.records
+            self.records = []
             part = self.part
             self.part += 1
-        if not payload:
+        if not records:
             return
         gz = io.BytesIO()
         with gzip.GzipFile(fileobj=gz, mode="wb", compresslevel=6) as g:
-            g.write(payload.encode("utf-8"))
+            for rec in records:
+                g.write(json.dumps(rec, separators=(",", ":")).encode("utf-8") + b"\n")
         now = datetime.datetime.now(datetime.timezone.utc)
         date, hour = _hive(now)
         name = f"viewer-logs/date={date}/hour={hour}/part-{int(time.time())}-{part}.jsonl.gz"
@@ -193,7 +287,7 @@ class Shipper:
         blob.content_type = "application/json"
         blob.content_encoding = "gzip"
         blob.upload_from_string(gz.getvalue(), content_type="application/json")
-        print(f"uploaded {name} ({count} lines, {gz.getbuffer().nbytes} bytes)", flush=True)
+        print(f"uploaded {name} ({len(records)} lines, {gz.getbuffer().nbytes} bytes)", flush=True)
 
     def run(self):
         last_flush = time.time()
@@ -205,17 +299,26 @@ class Shipper:
                     if rec is None:
                         continue
                     total += 1
+                    ip = rec["client_ip"]
+                    if ip:
+                        cc, cn, isp, asn, org = self.geo.get(ip)
+                        rec["country_code"] = cc
+                        rec["country"] = cn
+                        rec["isp"] = isp
+                        rec["asn"] = int(asn) if str(asn).isdigit() else None
+                        rec["is_datacenter"] = is_datacenter(asn, org)
+                    else:
+                        rec.update(country_code="", country="", isp="", asn=None, is_datacenter=False)
                     with self.lock:
-                        self.buf.write(json.dumps(rec, separators=(",", ":")) + "\n")
-                        self.count += 1
+                        self.records.append(rec)
             except FileNotFoundError:
                 pass
             if total > MAX_OLD_LINES:
                 print(f"rate cap hit ({total} lines), dropping tail", flush=True)
                 return
             now = time.time()
-            size = self.buf.tell()
-            if (now - last_flush >= FLUSH_SECONDS) or (size >= FLUSH_BYTES):
+            size = len(self.records)
+            if (now - last_flush >= FLUSH_SECONDS) or (size * 250 >= FLUSH_BYTES):
                 self._flush()
                 last_flush = now
             time.sleep(2)
