@@ -3,6 +3,8 @@
 Reads the NPM real-viewer log (X-Forwarded-For), computes distinct viewers
 over a window, and returns JSON with optional country/ISP breakdown.
 
+IPv6 viewers are counted. Geo: IPv4 via ip-api.com, IPv6 via ipwho.is.
+
 Endpoints:
   GET /health                          -> {"status": "ok"}
   GET /api/viewers?minutes=5           -> live viewers (+ streams, optional countries=1)
@@ -79,6 +81,14 @@ def read_window(minutes):
 
 def geo_lookup(ip):
     try:
+        if ":" in ip:
+            url = "https://ipwho.is/" + urllib.parse.quote(ip)
+            with urllib.request.urlopen(url, timeout=4) as r:
+                data = json.loads(r.read().decode())
+            cc = data.get("country_code", "")
+            cn = data.get("country", "")
+            isp = data.get("connection", {}).get("isp", "")
+            return cc, cn, isp
         url = "http://ip-api.com/json/" + urllib.parse.quote(ip) + "?fields=query,countryCode,country,isp"
         with urllib.request.urlopen(url, timeout=4) as r:
             data = json.loads(r.read().decode())
@@ -108,11 +118,29 @@ def store_geo(ip, cc, cn, isp):
         pass
 
 
+def extract_ips(rows):
+    ips = []
+    for l in rows:
+        cm = _CLIENT.search(l)
+        if not cm:
+            continue
+        ip = cm.group(1)
+        if ip == "-":
+            continue
+        ips.append(ip)
+    return ips
+
+
 def build_stats(minutes, with_countries):
     rows = read_window(minutes)
-    ip_set = sorted(set(i for i in (_CLIENT.search(l).group(1) for l in rows if _CLIENT.search(l)) if i and ":" not in i))
+    ip_list = extract_ips(rows)
+    ip_set = sorted(set(ip_list))
+    v4 = sum(1 for i in ip_set if ":" not in i)
+    v6 = len(ip_set) - v4
     result = {
         "viewers": len(ip_set),
+        "ipv4": v4,
+        "ipv6": v6,
         "window_minutes": minutes,
         "streams": {},
     }
@@ -123,7 +151,7 @@ def build_stats(minutes, with_countries):
         if not cm or not sm:
             continue
         ip = cm.group(1)
-        if ":" in ip:
+        if ip == "-":
             continue
         streams.setdefault(sm.group(1), set()).add(ip)
     result["streams"] = {k: len(v) for k, v in sorted(streams.items())}
@@ -146,7 +174,7 @@ def build_stats(minutes, with_countries):
 
 
 def backfill_history():
-    """Scan the log once, bucket distinct IPv4 viewers per minute, write history."""
+    """Scan the log once, bucket distinct viewers per minute, write history."""
     buckets = {}
     try:
         size = os.path.getsize(LOG)
@@ -163,7 +191,7 @@ def backfill_history():
                 if not cm:
                     continue
                 ip = cm.group(1)
-                if ":" in ip:
+                if ip == "-":
                     continue
                 buckets.setdefault(_bucket_ts(ts), set()).add(ip)
     except FileNotFoundError:
@@ -179,7 +207,7 @@ def sample_loop():
         time.sleep(SAMPLE_INTERVAL)
         try:
             rows = read_window(DEFAULT_MINUTES)
-            ips = set(i for i in (_CLIENT.search(l).group(1) for l in rows if _CLIENT.search(l)) if i and ":" not in i)
+            ips = set(extract_ips(rows))
             b = _bucket_ts(datetime.datetime.now(datetime.timezone.utc))
             with _hist_lock:
                 with open(HISTORY, "a") as f:
@@ -248,9 +276,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 peak = {"peak_viewers": 0, "peak_time": None, "window_minutes": minutes, "samples": 0}
             try:
-                peak["current_viewers"] = len(
-                    set(i for i in (_CLIENT.search(l).group(1) for l in read_window(DEFAULT_MINUTES) if _CLIENT.search(l)) if i and ":" not in i)
-                )
+                peak["current_viewers"] = len(set(extract_ips(read_window(DEFAULT_MINUTES))))
             except Exception:
                 pass
             self._json(peak)
