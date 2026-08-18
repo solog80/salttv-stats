@@ -30,14 +30,18 @@ if [ "$SHOW_COUNTRY" = "--countries" ] && [ "$TOTAL" -gt 0 ]; then
       cc=$(echo "$geo" | grep -oE "\"country_code\":\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
       cname=$(echo "$geo" | grep -oE "\"country\":\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
       isp=$(echo "$geo" | grep -oE "\"isp\":\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
+      asn=$(echo "$geo" | grep -oE "\"asn\": ?[0-9]*" | head -1 | grep -oE "[0-9]+")
+      org=$(echo "$geo" | grep -oE "\"org\":\"[^\"]*\"" | head -1 | cut -d"\"" -f4)
     else
-      geo=$(curl -s -m 4 "http://ip-api.com/json/$ip?fields=query,countryCode,country,isp" 2>/dev/null)
+      geo=$(curl -s -m 4 "http://ip-api.com/json/$ip?fields=query,countryCode,country,isp,org,as,hosting,proxy" 2>/dev/null)
       cc=$(echo "$geo" | grep -oE "\"countryCode\":\"[^\"]*\"" | cut -d"\"" -f4)
       cname=$(echo "$geo" | grep -oE "\"country\":\"[^\"]*\"" | cut -d"\"" -f4)
       isp=$(echo "$geo" | grep -oE "\"isp\":\"[^\"]*\"" | cut -d"\"" -f4)
+      asn=$(echo "$geo" | grep -oE "\"as\":\"AS[0-9]+" | grep -oE "[0-9]+")
+      org=$(echo "$geo" | grep -oE "\"org\":\"[^\"]*\"" | cut -d"\"" -f4)
     fi
-    echo -e "$ip\t$cc\t$cname\t$isp" >> /tmp/vw_geo.tsv
-    echo -e "$ip\t$cc\t$cname\t$isp" >> "$CACHE"
+    echo -e "$ip\t$cc\t$cname\t$isp\t$asn\t$org" >> /tmp/vw_geo.tsv
+    echo -e "$ip\t$cc\t$cname\t$isp\t$asn\t$org" >> "$CACHE"
     sleep 0.3
   done < /tmp/vw_ips.txt
   python3 /home/customer/vw_geo.py /tmp/vw_geo.tsv

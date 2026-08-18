@@ -4,10 +4,12 @@ Reads the NPM real-viewer log (X-Forwarded-For), computes distinct viewers
 over a window, and returns JSON with optional country/ISP breakdown.
 
 IPv6 viewers are counted. Geo: IPv4 via ip-api.com, IPv6 via ipwho.is.
+Datacenter/hosting IPs (by ASN or org keyword) can be excluded via filter_dc=1.
 
 Endpoints:
   GET /health                          -> {"status": "ok"}
-  GET /api/viewers?minutes=5           -> live viewers (+ streams, optional countries=1)
+  GET /api/viewers?minutes=5           -> live viewers (+ streams, countries=1)
+  GET /api/viewers?minutes=5&filter_dc=1 -> exclude datacenter IPs (default on)
   GET /api/viewers/peak?minutes=60     -> peak viewers within window (default: all history)
 """
 import json
@@ -33,6 +35,47 @@ _TS = re.compile(r"^(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})")
 _MONTHS = {m: i for i, m in enumerate(calendar.month_abbr) if m}
 _CLIENT = re.compile(r"client=([^ ]+)")
 _STREAM = re.compile(r"/(app/[^/]+)/")
+
+# Known datacenter / hosting / cloud ASNs (inflate viewer counts).
+DC_ASNS = {
+    24940, 213239,  # Hetzner
+    212238, 60068,  # Datacamp / CDN77
+    15169,          # Google
+    16509, 14618,   # Amazon AWS
+    8075,           # Microsoft Azure
+    14061,          # DigitalOcean
+    16276,          # OVH
+    20473,          # Vultr / Choopa
+    63949,          # Linode / Akamai
+    51167,          # Contabo
+    13335,          # Cloudflare
+    31898,          # Oracle Cloud
+    45102,          # Alibaba Cloud
+    54113,          # Fastly
+    20940,          # Akamai
+}
+DC_KEYWORDS = (
+    "hetzner", "datacamp", "digitalocean", "vultr", "linode", "contabo",
+    "ovh", "scaleway", "upcloud", "choopa", "amazon", "amazonaws",
+    "microsoft azure", "google cloud", "oracle cloud", "alibaba",
+    "cloudflare", "fastly", "akamai", "incapsula", "imperva",
+    "datacenter", "data center", "hosting", "dedicated server", "vps",
+)
+
+
+def is_datacenter(asn, org):
+    if asn:
+        try:
+            if int(asn) in DC_ASNS:
+                return True
+        except (TypeError, ValueError):
+            pass
+    if org:
+        o = org.lower()
+        if any(k in o for k in DC_KEYWORDS):
+            return True
+    return False
+
 
 _hist_lock = threading.Lock()
 
@@ -88,13 +131,24 @@ def geo_lookup(ip):
             cc = data.get("country_code", "")
             cn = data.get("country", "")
             isp = data.get("connection", {}).get("isp", "")
-            return cc, cn, isp
-        url = "http://ip-api.com/json/" + urllib.parse.quote(ip) + "?fields=query,countryCode,country,isp"
+            org = data.get("connection", {}).get("org", "") or isp
+            asn = data.get("connection", {}).get("asn", "")
+            return cc, cn, isp, asn, org
+        url = "http://ip-api.com/json/" + urllib.parse.quote(ip) + "?fields=query,countryCode,country,isp,org,as,hosting,proxy"
         with urllib.request.urlopen(url, timeout=4) as r:
             data = json.loads(r.read().decode())
-        return data.get("countryCode", ""), data.get("country", ""), data.get("isp", "")
+        cc = data.get("countryCode", "")
+        cn = data.get("country", "")
+        isp = data.get("isp", "")
+        org = data.get("org", "") or isp
+        asn = data.get("as", "")
+        asn_num = None
+        m = re.match(r"AS(\d+)", str(asn))
+        if m:
+            asn_num = int(m.group(1))
+        return cc, cn, isp, asn_num, org
     except Exception:
-        return "", "", ""
+        return "", "", "", "", ""
 
 
 def cached_geo(ip):
@@ -104,18 +158,35 @@ def cached_geo(ip):
                 if ln.startswith(ip + "\t"):
                     parts = ln.rstrip("\n").split("\t")
                     if len(parts) >= 4:
-                        return parts[1], parts[2], parts[3]
+                        asn = parts[4] if len(parts) > 4 else ""
+                        try:
+                            asn = int(asn)
+                        except ValueError:
+                            asn = ""
+                        org = parts[5] if len(parts) > 5 else ""
+                        return parts[1], parts[2], parts[3], asn, org
     except FileNotFoundError:
         pass
     return None
 
 
-def store_geo(ip, cc, cn, isp):
+def store_geo(ip, cc, cn, isp, asn, org):
     try:
         with open(CACHE, "a") as f:
-            f.write(f"{ip}\t{cc}\t{cn}\t{isp}\n")
+            f.write(f"{ip}\t{cc}\t{cn}\t{isp}\t{asn}\t{org}\n")
     except Exception:
         pass
+
+
+def geo_for(ip):
+    """Return geo tuple for ip, using cache or live lookup (and caching)."""
+    g = cached_geo(ip)
+    if g is None:
+        g = geo_lookup(ip)
+        store_geo(ip, g[0], g[1], g[2], g[3], g[4])
+        time.sleep(0.2)
+        g = cached_geo(ip) or g
+    return g
 
 
 def extract_ips(rows):
@@ -131,16 +202,25 @@ def extract_ips(rows):
     return ips
 
 
-def build_stats(minutes, with_countries):
+def filter_dc_ips(ip_list):
+    """Return (kept, excluded) split of ips by datacenter classification."""
+    kept, excluded = [], []
+    for ip in ip_list:
+        g = geo_for(ip)
+        if g and is_datacenter(g[3], g[4]):
+            excluded.append(ip)
+        else:
+            kept.append(ip)
+    return kept, excluded
+
+
+def build_stats(minutes, with_countries, filter_dc):
     rows = read_window(minutes)
-    ip_list = extract_ips(rows)
-    ip_set = sorted(set(ip_list))
-    v4 = sum(1 for i in ip_set if ":" not in i)
-    v6 = len(ip_set) - v4
+    ip_set = sorted(set(extract_ips(rows)))
     result = {
         "viewers": len(ip_set),
-        "ipv4": v4,
-        "ipv6": v6,
+        "ipv4": sum(1 for i in ip_set if ":" not in i),
+        "ipv6": sum(1 for i in ip_set if ":" in i),
         "window_minutes": minutes,
         "streams": {},
     }
@@ -156,16 +236,24 @@ def build_stats(minutes, with_countries):
         streams.setdefault(sm.group(1), set()).add(ip)
     result["streams"] = {k: len(v) for k, v in sorted(streams.items())}
 
+    dc_ips = set()
+    if filter_dc:
+        ip_set, dc_ips = filter_dc_ips(ip_set)
+        result["excluded_datacenters"] = sorted(dc_ips)
+        result["excluded_datacenters_count"] = len(dc_ips)
+        result["viewers"] = len(ip_set)
+        result["ipv4"] = sum(1 for i in ip_set if ":" not in i)
+        result["ipv6"] = sum(1 for i in ip_set if ":" in i)
+        result["streams"] = {
+            k: len(v - set(dc_ips)) for k, v in sorted(streams.items())
+        }
+
     if with_countries and ip_set:
         countries = Counter()
         isps = Counter()
         for ip in ip_set:
-            g = cached_geo(ip)
-            if g is None:
-                g = geo_lookup(ip)
-                store_geo(ip, g[0], g[1], g[2])
-                time.sleep(0.2)
-            if g[0]:
+            g = geo_for(ip)
+            if g and g[0]:
                 countries[(g[0], g[1])] += 1
                 isps[(g[0], g[2])] += 1
         result["countries"] = [{"code": c, "name": n, "viewers": v} for (c, n), v in countries.most_common()]
@@ -174,7 +262,7 @@ def build_stats(minutes, with_countries):
 
 
 def backfill_history():
-    """Scan the log once, bucket distinct viewers per minute, write history."""
+    """Scan the log once, bucket distinct (non-datacenter) viewers per minute."""
     buckets = {}
     try:
         size = os.path.getsize(LOG)
@@ -208,6 +296,7 @@ def sample_loop():
         try:
             rows = read_window(DEFAULT_MINUTES)
             ips = set(extract_ips(rows))
+            ips, _ = filter_dc_ips(list(ips))
             b = _bucket_ts(datetime.datetime.now(datetime.timezone.utc))
             with _hist_lock:
                 with open(HISTORY, "a") as f:
@@ -276,7 +365,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 peak = {"peak_viewers": 0, "peak_time": None, "window_minutes": minutes, "samples": 0}
             try:
-                peak["current_viewers"] = len(set(extract_ips(read_window(DEFAULT_MINUTES))))
+                current = list(set(extract_ips(read_window(DEFAULT_MINUTES))))
+                current, _ = filter_dc_ips(current)
+                peak["current_viewers"] = len(current)
             except Exception:
                 pass
             self._json(peak)
@@ -287,8 +378,9 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             minutes = DEFAULT_MINUTES
         with_countries = qs.get("countries", ["0"])[0].lower() in ("1", "true", "yes")
+        filter_dc = qs.get("filter_dc", ["1"])[0].lower() not in ("0", "false", "no")
         try:
-            stats = build_stats(minutes, with_countries)
+            stats = build_stats(minutes, with_countries, filter_dc)
             self._json(stats)
         except Exception as e:
             self._json({"error": str(e)}, 500)
