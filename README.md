@@ -23,6 +23,7 @@ a small HTTP API that reads it to compute live/peak viewer stats.
 | `viewers_api.py` | Self-contained stdlib-only Python HTTP API (no pip deps) |
 | `viewers.sh` | CLI version of the same stats, for quick terminal use |
 | `viewers_nginx.conf` | NPM custom config that enables the real-viewer access log |
+| `gcs_shipper.py` | Ships the NPM log to GCS/BigQuery as gzipped NDJSON (geo/ASN enriched) |
 
 ## API Endpoints
 
@@ -99,8 +100,61 @@ fetch("https://stats.salttelevision.com/api/viewers?minutes=5&countries=1")
    60 s), which powers the peak endpoint.
 
 3. **Geo lookup.** Country/ISP resolution uses the free
-   [ip-api.com](https://ip-api.com) API (IPv4 only), cached to
-   `/cache/geo.tsv` to avoid repeated lookups and respect rate limits.
+   [ip-api.com](https://ip-api.com) API (IPv4 only) and
+   [ipwho.is](https://ipwho.is) (IPv6), cached to `/cache/geo.tsv` to avoid
+   repeated lookups and respect rate limits. Datacenter/hosting IPs are
+   identified by ASN blocklist + org keywords and excluded from counts by
+   default (`filter_dc=0` to include them).
+
+## BigQuery pipeline (GCS + external table)
+
+In addition to the HTTP API, every NPM log line is shipped to Google
+BigQuery for long-term storage and SQL analytics — no Firebase involved.
+
+```
+Edge NPM viewer log ──► log-shipper container (parse + geo/ASN enrich, gzip)
+   ──► gs://salt-media-app1-viewer-logs/viewer-logs/date=YYYYMMDD/hour=HH/*.jsonl.gz
+   ──► BigQuery external table viewer_logs.viewer_requests (live, free ingestion)
+   ──► scheduled MERGE ──► viewer_logs.viewer_requests_native (DAY-partitioned on ts)
+```
+
+- **Shipper**: `gcs_shipper.py` runs as the `log-shipper` container on the
+  edge. It reads the NPM log by byte offset (idempotent across restarts),
+  parses each line, enriches with `country_code/country/isp/asn/
+  is_datacenter`, and uploads gzipped NDJSON every 30 s. IPv4 geo via
+  ip-api.com, IPv6 via ipwho.is, cached to `/state/geo.tsv` (seeded from the
+  stats API cache).
+- **External table** (`viewer_logs.viewer_requests`): reads GCS live via
+  hive partitioning on `date`/`hour`. Schema: `ts, status, uri, stream,
+  file_type, session, client_ip, user_agent, referer, country_code, country,
+  isp, asn, is_datacenter`.
+- **Filtered view** (`viewer_logs.viewer_requests_real`): `WHERE NOT
+  is_datacenter` — the BigQuery equivalent of `filter_dc=1`.
+- **Native table** (`viewer_logs.viewer_requests_native`): a scheduled query
+  runs every 10 min and `MERGE`s new rows (deduped on `ts+client_ip+uri`)
+  into a DAY-partitioned table for faster queries.
+
+GCP setup: bucket `salt-media-app1-viewer-logs` (EU nearline); the
+`firebase-adminsdk-ruyjd` service account holds `bigquery.dataEditor`,
+`bigquery.jobUser`, and `storage.objectAdmin`. Credentials are mounted into
+the container at `/creds/creds.json`.
+
+Example SQL:
+
+```sql
+-- Real (non-datacenter) viewers per stream, per minute
+SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, stream,
+       COUNT(DISTINCT client_ip) AS viewers
+FROM `viewer_logs.viewer_requests_real`
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
+GROUP BY minute, stream ORDER BY minute DESC;
+
+-- Countries of real viewers, last 30 min
+SELECT country, COUNT(DISTINCT client_ip) AS viewers
+FROM `viewer_logs.viewer_requests_real`
+WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
+GROUP BY country ORDER BY viewers DESC;
+```
 
 ## Deployment
 
