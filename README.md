@@ -156,6 +156,129 @@ WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
 GROUP BY country ORDER BY viewers DESC;
 ```
 
+## Adding viewer stats to your React app
+
+Never query BigQuery directly from the browser — the service account key would
+be exposed. Instead, add a small **Firebase Function** that runs the SQL
+server-side and returns JSON, then call it from React.
+
+### 1. Firebase Function
+
+In your Firebase project (`salt-media-app1`), add a callable function:
+
+```js
+// functions/index.js (or getViewerStats.js)
+const functions = require("firebase-functions");
+const admin = require("firebase-admin");
+const { BigQuery } = require("@google-cloud/bigquery");
+
+admin.initializeApp();
+const bq = new BigQuery({ projectId: "salt-media-app1" });
+
+const REAL_VIEWERS_SQL = `
+  SELECT TIMESTAMP_TRUNC(ts, MINUTE) AS minute, stream,
+         COUNT(DISTINCT client_ip) AS viewers
+  FROM \`viewer_logs.viewer_requests_real\`
+  WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @minutes MINUTE)
+  GROUP BY minute, stream
+  ORDER BY minute DESC`;
+
+exports.getViewerStats = functions.https.onCall(async (data) => {
+  const minutes = Math.min(Math.max(parseInt(data.minutes, 10) || 30, 1), 60 * 24);
+  const [rows] = await bq.query({ query: REAL_VIEWERS_SQL, params: { minutes } });
+  return { viewers: rows };
+});
+
+exports.getViewerCountries = functions.https.onCall(async () => {
+  const [rows] = await bq.query({
+    query: `
+      SELECT country, COUNT(DISTINCT client_ip) AS viewers
+      FROM \`viewer_logs.viewer_requests_real\`
+      WHERE ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
+      GROUP BY country ORDER BY viewers DESC`,
+  });
+  return { countries: rows };
+});
+```
+
+```bash
+# functions/package.json — add the BigQuery client
+npm install @google-cloud/bigquery
+firebase deploy --only functions
+```
+
+The function's runtime service account needs BigQuery read access (run once):
+
+```bash
+gcloud projects add-iam-policy-binding salt-media-app1 \
+  --member="serviceAccount:salt-media-app1@appspot.gserviceaccount.com" \
+  --role="roles/bigquery.dataViewer"
+gcloud projects add-iam-policy-binding salt-media-app1 \
+  --member="serviceAccount:salt-media-app1@appspot.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+```
+
+> Use `viewer_logs.viewer_requests_real` (the filtered view) for real
+> viewer counts, or `viewer_logs.viewer_requests_native` (faster) with
+> `WHERE NOT is_datacenter`.
+
+### 2. React hook
+
+```js
+// useViewerStats.js
+import { getFunctions, httpsCallable } from "firebase/functions";
+
+export function useViewerStats(minutes = 30) {
+  const [stats, setStats] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const fn = httpsCallable(getFunctions(), "getViewerStats");
+    let cancelled = false;
+    fn({ minutes }).then(({ data }) => {
+      if (!cancelled) setStats(data.viewers);
+    }).catch(setError);
+    return () => { cancelled = true; };
+  }, [minutes]);
+
+  return { stats, error };
+}
+```
+
+```jsx
+// MyViewerCard.jsx
+import { useViewerStats } from "./useViewerStats";
+
+export default function MyViewerCard() {
+  const { stats, error } = useViewerStats(30);
+  if (error) return <div>Error: {error.message}</div>;
+  if (!stats) return <div>Loading…</div>;
+
+  const total = stats.reduce((n, s) => n + s.viewers, 0);
+  return (
+    <div>
+      <h3>Live viewers: {total}</h3>
+      <ul>
+        {stats.map(s => (
+          <li key={s.minute}>{s.minute} — {s.stream}: {s.viewers}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+### 3. Live numbers without a backend
+
+For the current 5-minute live viewer count you can call the edge API directly
+from the browser (CORS is open):
+
+```js
+fetch("https://stats.salttelevision.com/api/viewers?minutes=5&countries=1")
+  .then(r => r.json())
+  .then(d => console.log(d.viewers, d.countries));
+```
+
 ## Deployment
 
 On the edge server (`198.204.224.170`):
