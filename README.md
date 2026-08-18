@@ -124,6 +124,20 @@ Edge NPM viewer log ──► log-shipper container (parse + geo/ASN enrich, gzi
   is_datacenter`, and uploads gzipped NDJSON every 30 s. IPv4 geo via
   ip-api.com, IPv6 via ipwho.is, cached to `/state/geo.tsv` (seeded from the
   stats API cache).
+
+  All configuration is injected at runtime via environment variables (no
+  secrets or values baked into the repo):
+
+  | Variable | Purpose | Example |
+  |----------|---------|---------|
+  | `BUCKET` | GCS bucket to upload to | `salt-media-app1-viewer-logs` |
+  | `GCP_PROJECT` | GCP project for the storage client | `salt-media-app1` |
+  | `LOG` | NPM real-viewer log path | `/logs/proxy-host-4_viewers.log` |
+  | `STATE` | Byte-offset state file (idempotency) | `/state/offset` |
+  | `GEO_FILE` | Enriched geo cache (6 cols) | `/state/geo.tsv` |
+  | `SEED_GEO` | Seed cache from the stats API | `/cache/geo.tsv` |
+  | `FLUSH_SECONDS` | Upload interval (default 60) | `30` |
+  | `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON path | `/creds/creds.json` |
 - **External table** (`<dataset>.viewer_requests`): reads GCS live via
   hive partitioning on `date`/`hour`. Schema: `ts, status, uri, stream,
   file_type, session, client_ip, user_agent, referer, country_code, country,
@@ -138,6 +152,31 @@ GCP setup: bucket `<bucket-name>` (EU nearline); the
 `<sa-name>` service account holds `bigquery.dataEditor`,
 `bigquery.jobUser`, and `storage.objectAdmin`. Credentials are mounted into
 the container at `/creds/creds.json`.
+
+Deploy the shipper (all real values passed as env, nothing hardcoded):
+
+```bash
+docker run -d --name log-shipper --restart unless-stopped \
+  -v /data/compose/21/data/logs:/logs:ro \
+  -v /home/customer/shipper/creds.json:/creds/creds.json:ro \
+  -v /home/customer/shipper/state:/state \
+  -v /home/customer/vstats/cache:/cache:ro \
+  -e LOG=/logs/proxy-host-4_viewers.log \
+  -e BUCKET=salt-media-app1-viewer-logs \
+  -e GCP_PROJECT=salt-media-app1 \
+  -e STATE=/state/offset \
+  -e GEO_FILE=/state/geo.tsv \
+  -e SEED_GEO=/cache/geo.tsv \
+  -e FLUSH_SECONDS=30 \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/creds/creds.json \
+  log-shipper
+```
+
+Build the image from the repo:
+
+```bash
+docker build -t log-shipper -f Dockerfile .
+```
 
 Example SQL:
 
